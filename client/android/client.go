@@ -1,3 +1,5 @@
+//go:build android
+
 package android
 
 import (
@@ -6,12 +8,15 @@ import (
 
 	log "github.com/sirupsen/logrus"
 
+	"github.com/netbirdio/netbird/client/iface/device"
 	"github.com/netbirdio/netbird/client/internal"
+	"github.com/netbirdio/netbird/client/internal/dns"
+	"github.com/netbirdio/netbird/client/internal/listener"
 	"github.com/netbirdio/netbird/client/internal/peer"
 	"github.com/netbirdio/netbird/client/internal/stdnet"
 	"github.com/netbirdio/netbird/client/system"
 	"github.com/netbirdio/netbird/formatter"
-	"github.com/netbirdio/netbird/iface"
+	"github.com/netbirdio/netbird/util/net"
 )
 
 // ConnectionListener export internal Listener for mobile
@@ -21,12 +26,22 @@ type ConnectionListener interface {
 
 // TunAdapter export internal TunAdapter for mobile
 type TunAdapter interface {
-	iface.TunAdapter
+	device.TunAdapter
 }
 
 // IFaceDiscover export internal IFaceDiscover for mobile
 type IFaceDiscover interface {
-	stdnet.IFaceDiscover
+	stdnet.ExternalIFaceDiscover
+}
+
+// NetworkChangeListener export internal NetworkChangeListener for mobile
+type NetworkChangeListener interface {
+	listener.NetworkChangeListener
+}
+
+// DnsReadyListener export internal dns ReadyListener for mobile
+type DnsReadyListener interface {
+	dns.ReadyListener
 }
 
 func init() {
@@ -35,32 +50,34 @@ func init() {
 
 // Client struct manage the life circle of background service
 type Client struct {
-	cfgFile       string
-	tunAdapter    iface.TunAdapter
-	iFaceDiscover IFaceDiscover
-	recorder      *peer.Status
-	ctxCancel     context.CancelFunc
-	ctxCancelLock *sync.Mutex
-	deviceName    string
+	cfgFile               string
+	tunAdapter            device.TunAdapter
+	iFaceDiscover         IFaceDiscover
+	recorder              *peer.Status
+	ctxCancel             context.CancelFunc
+	ctxCancelLock         *sync.Mutex
+	deviceName            string
+	uiVersion             string
+	networkChangeListener listener.NetworkChangeListener
 }
 
 // NewClient instantiate a new Client
-func NewClient(cfgFile, deviceName string, tunAdapter TunAdapter, iFaceDiscover IFaceDiscover) *Client {
-	lvl, _ := log.ParseLevel("trace")
-	log.SetLevel(lvl)
-
+func NewClient(cfgFile, deviceName string, uiVersion string, tunAdapter TunAdapter, iFaceDiscover IFaceDiscover, networkChangeListener NetworkChangeListener) *Client {
+	net.SetAndroidProtectSocketFn(tunAdapter.ProtectSocket)
 	return &Client{
-		cfgFile:       cfgFile,
-		deviceName:    deviceName,
-		tunAdapter:    tunAdapter,
-		iFaceDiscover: iFaceDiscover,
-		recorder:      peer.NewRecorder(""),
-		ctxCancelLock: &sync.Mutex{},
+		cfgFile:               cfgFile,
+		deviceName:            deviceName,
+		uiVersion:             uiVersion,
+		tunAdapter:            tunAdapter,
+		iFaceDiscover:         iFaceDiscover,
+		recorder:              peer.NewRecorder(""),
+		ctxCancelLock:         &sync.Mutex{},
+		networkChangeListener: networkChangeListener,
 	}
 }
 
 // Run start the internal client. It is a blocker function
-func (c *Client) Run(urlOpener URLOpener) error {
+func (c *Client) Run(urlOpener URLOpener, dns *DNSList, dnsReadyListener DnsReadyListener) error {
 	cfg, err := internal.UpdateOrCreateConfig(internal.ConfigInput{
 		ConfigPath: c.cfgFile,
 	})
@@ -68,10 +85,14 @@ func (c *Client) Run(urlOpener URLOpener) error {
 		return err
 	}
 	c.recorder.UpdateManagementAddress(cfg.ManagementURL.String())
+	c.recorder.UpdateRosenpass(cfg.RosenpassEnabled, cfg.RosenpassPermissive)
 
 	var ctx context.Context
 	//nolint
 	ctxWithValues := context.WithValue(context.Background(), system.DeviceNameCtxKey, c.deviceName)
+	//nolint
+	ctxWithValues = context.WithValue(ctxWithValues, system.UiVersionCtxKey, c.uiVersion)
+
 	c.ctxCancelLock.Lock()
 	ctx, c.ctxCancel = context.WithCancel(ctxWithValues)
 	defer c.ctxCancel()
@@ -85,7 +106,34 @@ func (c *Client) Run(urlOpener URLOpener) error {
 
 	// todo do not throw error in case of cancelled context
 	ctx = internal.CtxInitState(ctx)
-	return internal.RunClient(ctx, cfg, c.recorder, c.tunAdapter, c.iFaceDiscover)
+	connectClient := internal.NewConnectClient(ctx, cfg, c.recorder)
+	return connectClient.RunOnAndroid(c.tunAdapter, c.iFaceDiscover, c.networkChangeListener, dns.items, dnsReadyListener)
+}
+
+// RunWithoutLogin we apply this type of run function when the backed has been started without UI (i.e. after reboot).
+// In this case make no sense handle registration steps.
+func (c *Client) RunWithoutLogin(dns *DNSList, dnsReadyListener DnsReadyListener) error {
+	cfg, err := internal.UpdateOrCreateConfig(internal.ConfigInput{
+		ConfigPath: c.cfgFile,
+	})
+	if err != nil {
+		return err
+	}
+	c.recorder.UpdateManagementAddress(cfg.ManagementURL.String())
+	c.recorder.UpdateRosenpass(cfg.RosenpassEnabled, cfg.RosenpassPermissive)
+
+	var ctx context.Context
+	//nolint
+	ctxWithValues := context.WithValue(context.Background(), system.DeviceNameCtxKey, c.deviceName)
+	c.ctxCancelLock.Lock()
+	ctx, c.ctxCancel = context.WithCancel(ctxWithValues)
+	defer c.ctxCancel()
+	c.ctxCancelLock.Unlock()
+
+	// todo do not throw error in case of cancelled context
+	ctx = internal.CtxInitState(ctx)
+	connectClient := internal.NewConnectClient(ctx, cfg, c.recorder)
+	return connectClient.RunOnAndroid(c.tunAdapter, c.iFaceDiscover, c.networkChangeListener, dns.items, dnsReadyListener)
 }
 
 // Stop the internal client and free the resources
@@ -99,6 +147,16 @@ func (c *Client) Stop() {
 	c.ctxCancel()
 }
 
+// SetTraceLogLevel configure the logger to trace level
+func (c *Client) SetTraceLogLevel() {
+	log.SetLevel(log.TraceLevel)
+}
+
+// SetInfoLogLevel configure the logger to info level
+func (c *Client) SetInfoLogLevel() {
+	log.SetLevel(log.InfoLevel)
+}
+
 // PeersList return with the list of the PeerInfos
 func (c *Client) PeersList() *PeerInfoArray {
 
@@ -110,12 +168,21 @@ func (c *Client) PeersList() *PeerInfoArray {
 			p.IP,
 			p.FQDN,
 			p.ConnStatus.String(),
-			p.Direct,
 		}
 		peerInfos[n] = pi
 	}
-
 	return &PeerInfoArray{items: peerInfos}
+}
+
+// OnUpdatedHostDNS update the DNS servers addresses for root zones
+func (c *Client) OnUpdatedHostDNS(list *DNSList) error {
+	dnsServer, err := dns.GetServerDns()
+	if err != nil {
+		return err
+	}
+
+	dnsServer.OnUpdatedHostDNSServer(list.items)
+	return nil
 }
 
 // SetConnectionListener set the network connection listener

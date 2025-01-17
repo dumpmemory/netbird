@@ -16,11 +16,11 @@ import (
 // DeviceAuthorizationFlow represents Device Authorization Flow information
 type DeviceAuthorizationFlow struct {
 	Provider       string
-	ProviderConfig ProviderConfig
+	ProviderConfig DeviceAuthProviderConfig
 }
 
-// ProviderConfig has all attributes needed to initiate a device authorization flow
-type ProviderConfig struct {
+// DeviceAuthProviderConfig has all attributes needed to initiate a device authorization flow
+type DeviceAuthProviderConfig struct {
 	// ClientID An IDP application client id
 	ClientID string
 	// ClientSecret An IDP application client secret
@@ -34,6 +34,10 @@ type ProviderConfig struct {
 	TokenEndpoint string
 	// DeviceAuthEndpoint is the endpoint of an IDP manager where clients can obtain device authorization code
 	DeviceAuthEndpoint string
+	// Scopes provides the scopes to be included in the token request
+	Scope string
+	// UseIDToken indicates if the id token should be used for authentication
+	UseIDToken bool
 }
 
 // GetDeviceAuthorizationFlowInfo initialize a DeviceAuthorizationFlow instance and return with it
@@ -84,17 +88,24 @@ func GetDeviceAuthorizationFlowInfo(ctx context.Context, privateKey string, mgmU
 	deviceAuthorizationFlow := DeviceAuthorizationFlow{
 		Provider: protoDeviceAuthorizationFlow.Provider.String(),
 
-		ProviderConfig: ProviderConfig{
+		ProviderConfig: DeviceAuthProviderConfig{
 			Audience:           protoDeviceAuthorizationFlow.GetProviderConfig().GetAudience(),
 			ClientID:           protoDeviceAuthorizationFlow.GetProviderConfig().GetClientID(),
 			ClientSecret:       protoDeviceAuthorizationFlow.GetProviderConfig().GetClientSecret(),
 			Domain:             protoDeviceAuthorizationFlow.GetProviderConfig().Domain,
 			TokenEndpoint:      protoDeviceAuthorizationFlow.GetProviderConfig().GetTokenEndpoint(),
 			DeviceAuthEndpoint: protoDeviceAuthorizationFlow.GetProviderConfig().GetDeviceAuthEndpoint(),
+			Scope:              protoDeviceAuthorizationFlow.GetProviderConfig().GetScope(),
+			UseIDToken:         protoDeviceAuthorizationFlow.GetProviderConfig().GetUseIDToken(),
 		},
 	}
 
-	err = isProviderConfigValid(deviceAuthorizationFlow.ProviderConfig)
+	// keep compatibility with older management versions
+	if deviceAuthorizationFlow.ProviderConfig.Scope == "" {
+		deviceAuthorizationFlow.ProviderConfig.Scope = "openid"
+	}
+
+	err = isDeviceAuthProviderConfigValid(deviceAuthorizationFlow.ProviderConfig)
 	if err != nil {
 		return DeviceAuthorizationFlow{}, err
 	}
@@ -102,7 +113,7 @@ func GetDeviceAuthorizationFlowInfo(ctx context.Context, privateKey string, mgmU
 	return deviceAuthorizationFlow, nil
 }
 
-func isProviderConfigValid(config ProviderConfig) error {
+func isDeviceAuthProviderConfigValid(config DeviceAuthProviderConfig) error {
 	errorMSGFormat := "invalid provider configuration received from management: %s value is empty. Contact your NetBird administrator"
 	if config.Audience == "" {
 		return fmt.Errorf(errorMSGFormat, "Audience")
@@ -115,6 +126,9 @@ func isProviderConfigValid(config ProviderConfig) error {
 	}
 	if config.DeviceAuthEndpoint == "" {
 		return fmt.Errorf(errorMSGFormat, "Device Auth Endpoint")
+	}
+	if config.Scope == "" {
+		return fmt.Errorf(errorMSGFormat, "Device Auth Scopes")
 	}
 	return nil
 }

@@ -15,9 +15,9 @@ type notifier struct {
 	serverStateLock    sync.Mutex
 	listenersLock      sync.Mutex
 	listener           Listener
-	currentServerState bool
 	currentClientState bool
 	lastNotification   int
+	lastNumberOfPeers  int
 }
 
 func newNotifier() *notifier {
@@ -30,6 +30,7 @@ func (n *notifier) setListener(listener Listener) {
 
 	n.serverStateLock.Lock()
 	n.notifyListener(listener, n.lastNotification)
+	listener.OnPeersListChanged(n.lastNumberOfPeers)
 	n.serverStateLock.Unlock()
 
 	n.listener = listener
@@ -45,24 +46,14 @@ func (n *notifier) updateServerStates(mgmState bool, signalState bool) {
 	n.serverStateLock.Lock()
 	defer n.serverStateLock.Unlock()
 
-	var newState bool
-	if mgmState && signalState {
-		newState = true
-	} else {
-		newState = false
-	}
+	calculatedState := n.calculateState(mgmState, signalState)
 
-	if !n.isServerStateChanged(newState) {
+	if !n.isServerStateChanged(calculatedState) {
 		return
 	}
 
-	n.currentServerState = newState
+	n.lastNotification = calculatedState
 
-	if n.lastNotification == stateDisconnecting {
-		return
-	}
-
-	n.lastNotification = n.calculateState(newState, n.currentClientState)
 	n.notify(n.lastNotification)
 }
 
@@ -70,7 +61,7 @@ func (n *notifier) clientStart() {
 	n.serverStateLock.Lock()
 	defer n.serverStateLock.Unlock()
 	n.currentClientState = true
-	n.lastNotification = n.calculateState(n.currentServerState, true)
+	n.lastNotification = stateConnecting
 	n.notify(n.lastNotification)
 }
 
@@ -78,7 +69,7 @@ func (n *notifier) clientStop() {
 	n.serverStateLock.Lock()
 	defer n.serverStateLock.Unlock()
 	n.currentClientState = false
-	n.lastNotification = n.calculateState(n.currentServerState, false)
+	n.lastNotification = stateDisconnected
 	n.notify(n.lastNotification)
 }
 
@@ -90,8 +81,8 @@ func (n *notifier) clientTearDown() {
 	n.notify(n.lastNotification)
 }
 
-func (n *notifier) isServerStateChanged(newState bool) bool {
-	return n.currentServerState != newState
+func (n *notifier) isServerStateChanged(newState int) bool {
+	return n.lastNotification != newState
 }
 
 func (n *notifier) notify(state int) {
@@ -118,19 +109,24 @@ func (n *notifier) notifyListener(l Listener, state int) {
 	}()
 }
 
-func (n *notifier) calculateState(serverState bool, clientState bool) int {
-	if serverState && clientState {
+func (n *notifier) calculateState(managementConn, signalConn bool) int {
+	if managementConn && signalConn {
 		return stateConnected
 	}
 
-	if !clientState {
+	if !managementConn && !signalConn && !n.currentClientState {
 		return stateDisconnected
+	}
+
+	if n.lastNotification == stateDisconnecting {
+		return stateDisconnecting
 	}
 
 	return stateConnecting
 }
 
 func (n *notifier) peerListChanged(numOfPeers int) {
+	n.lastNumberOfPeers = numOfPeers
 	n.listenersLock.Lock()
 	defer n.listenersLock.Unlock()
 	if n.listener == nil {
